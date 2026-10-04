@@ -1,0 +1,115 @@
+# Customer Feedback Sentiment System
+
+Classifies incoming feedback as Positive / Negative / Neutral in real time and
+tracks the trend + top issues over time.
+
+## Architecture
+
+```
+feedback text
+     │
+     ▼
+preprocessing.py   → clean_text(): strip URLs/mentions, normalize unicode,
+                      collapse noise, unwrap hashtags
+     │
+     ▼
+sentiment_model.py → transformer classifier (RoBERTa/BERT), 3-class
+                      softmax over {negative, neutral, positive}
+     │
+     ▼
+database.py        → SQLAlchemy, one row per feedback item + scores
+     │
+     ▼
+main.py (FastAPI)  → POST /feedback     real-time inference + storage
+                      GET  /trends/*    aggregates for charts
+                      GET  /issues      top keywords in negative feedback
+     │
+     ▼
+dashboard          → the published interactive dashboard artifact,
+                      or any BI tool, reading from the endpoints above
+```
+
+## Why these choices
+
+- **Model**: `cardiffnlp/twitter-roberta-base-sentiment-latest` ships
+  pretrained for exactly the 3-class Positive/Negative/Neutral split, so
+  there's no fine-tuning step to get started. Swap `MODEL_NAME` in
+  `sentiment_model.py` for your own fine-tuned BERT checkpoint once you have
+  labeled domain data — no other file changes.
+- **Real-time inference**: the model loads once at process startup
+  (`get_classifier()` is a singleton) and each request just runs a forward
+  pass — no per-request model loading, so `/feedback` responds in well under
+  a second on CPU for short text, faster on GPU.
+- **Database**: SQLite by default (zero setup), switch to Postgres by setting
+  `DATABASE_URL` — no code changes needed elsewhere.
+- **Issue detection**: a lightweight keyword-frequency pass over negative
+  feedback (`GET /issues`). It's intentionally simple — swap in BERTopic or
+  LDA in `main.py` if you need real topic clusters instead of keywords.
+
+## Running it locally
+
+```bash
+cd backend
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+python seed_data.py        # populates feedback.db with sample data + dashboard_sample.json
+uvicorn main:app --reload --port 8000
+```
+
+Then open `http://localhost:8000/` — you should see `{"status":"ok",...}`. Also try:
+- `POST http://localhost:8000/feedback` with `{"text": "...", "source": "app_review"}`
+- `GET  http://localhost:8000/trends/daily`
+- `GET  http://localhost:8000/issues`
+
+**First run will be slow** (a minute or two) — it's downloading the ~500MB
+RoBERTa model from Hugging Face the first time `get_classifier()` runs.
+Every run after that is fast, since it's cached in `~/.cache/huggingface`.
+
+## Putting it on GitHub
+
+```bash
+cd sentiment-system
+git init
+git add .
+git commit -m "Initial commit: feedback sentiment system"
+gh repo create your-username/feedback-sentiment --public --source=. --push
+```
+
+(No `gh` CLI? Create an empty repo on github.com first, then:)
+
+```bash
+git remote add origin https://github.com/your-username/feedback-sentiment.git
+git branch -M main
+git push -u origin main
+```
+
+## Deploying it (so it's live on a URL, not just local)
+
+**Render (easiest — includes a one-click Postgres via the included `render.yaml`):**
+1. Push this repo to GitHub (above).
+2. On [render.com](https://render.com): New → Blueprint → pick your repo. Render reads `render.yaml` and provisions the web service + a free Postgres database automatically, wiring `DATABASE_URL` for you.
+3. Wait for the first deploy (a few minutes — it's downloading the model). Your API is live at `https://<your-service>.onrender.com`.
+
+**Railway / Fly.io / any Docker host:**
+- The included `Dockerfile` builds and runs the API as-is: `docker build -t feedback-api . && docker run -p 8000:8000 feedback-api`. Push the same image to Railway or Fly.io and point `DATABASE_URL` at their managed Postgres add-on.
+
+**Common errors and the fix already baked in here:**
+- *"relation does not exist"* on Postgres → fixed: `init_db()` runs automatically on startup via the FastAPI `lifespan` hook, so tables are created before the first request.
+- *App crashes on Render/Heroku-style hosts with `postgres://...` URL* → fixed: `database.py` rewrites `postgres://` to `postgresql://` automatically (SQLAlchemy 2.x requires the latter).
+- *"str | None" TypeError on older Python* → fixed: `from __future__ import annotations` at the top of `sentiment_model.py` and `main.py` makes the modern type hints safe on Python 3.9+.
+- *Healthcheck failing on the host* → fixed: `GET /` returns a plain 200 JSON status for platforms that ping the root path.
+
+## About the dashboard
+
+The interactive dashboard was published separately as a standalone page. It's
+built to read from `GET /trends/daily`, `GET /trends/summary`, and
+`GET /issues` — wire those three calls in once your API has a public URL. The
+published preview renders with the `dashboard_sample.json` snapshot
+(generated by `seed_data.py`) so you can see it working before wiring up a
+live backend.
+
+## Extending this
+
+- Batch import a CSV of historical feedback via `POST /feedback/batch`.
+- Add auth (API key or OAuth) to `main.py` before exposing this publicly.
+- Add a `/feedback/{id}` webhook or Slack alert when negative volume spikes.
